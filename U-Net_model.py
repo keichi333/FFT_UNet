@@ -108,66 +108,20 @@ class CamVidDataset(Dataset):
         plt.tight_layout()
         plt.show()
 
-######################
-#----自定义FFT实现----#
-######################
+###########################
+#----基于FFT的卷积实现----#
+###########################
 
-# 离散傅里叶变换
-def dft(x):
-    n = x.size(0)
-    x = x.view(n, -1)
-    k = torch.arange(n, device=x.device).view(-1, 1)
-    i = torch.arange(n, device=x.device).view(1, -1)
-    factor = -2j * torch.pi / n
-    W = torch.exp(factor * k * i)
-    return torch.matmul(W, x)
-
-# 递归实现的快速傅里叶变换（Cooley-Tukey算法）
-def fft(x):
-    x = x.clone()
-    n = x.size(0)
-    
-    if n <= 1:
-        return x
-    
-    # 检查n是否为2的幂
-    if n & (n - 1) != 0:
-        raise ValueError("Input size must be power of two")
-    
-    # 偶奇分离
-    even = fft(x[::2])
-    odd = fft(x[1::2])
-    
-    factor = torch.exp(-2j * torch.pi * torch.arange(n//2, device=x.device) / n)
-    return torch.cat([even + factor * odd, even - factor * odd])
-
-# 二维快速傅里叶变换
+# 二维快速傅里叶变换（使用PyTorch内置函数）
 def fft2(x):
-    # 先对行进行FFT
-    fft_rows = torch.stack([fft(row) for row in x])
-    # 再对列进行FFT
-    fft_cols = torch.stack([fft(col) for col in fft_rows.T]).T
-    return fft_cols
+    return torch.fft.fft2(x, norm='ortho')
 
-# 快速傅里叶逆变换
-def ifft(x):
-    n = x.size(0)
-    return fft(x.conj()) / n
-
-# 二维快速傅里叶逆变换
+# 二维快速傅里叶逆变换（使用PyTorch内置函数）
 def ifft2(x):
-    # 先对行进行IFFT
-    ifft_rows = torch.stack([ifft(row) for row in x])
-    # 再对列进行IFFT
-    ifft_cols = torch.stack([ifft(col) for col in ifft_rows.T]).T
-    return ifft_cols
+    return torch.fft.ifft2(x, norm='ortho')
 
-###############################
-#----基于自定义FFT的卷积实现----#
-###############################
-
-# 自定义FFT卷积
-class CustomFFTConv2d(nn.Module):
+# FFT卷积实现（推理阶段使用）
+class FFTConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True):
         super().__init__()
         self.in_channels = in_channels
@@ -181,11 +135,12 @@ class CustomFFTConv2d(nn.Module):
             torch.randn(out_channels, in_channels, kernel_size, kernel_size)
         )
         self.bias = nn.Parameter(torch.randn(out_channels)) if bias else None
-    
+        self.register_buffer('weight_fft', torch.zeros(0))  # 预分配FFT权重
+        
     def forward(self, x):
         batch_size, in_channels, height, width = x.size()
         
-        # 计算FFT尺寸（确保是2的幂）
+        # 计算FFT尺寸（确保能容纳卷积结果）
         fft_H = height + self.kernel_size - 1
         fft_W = width + self.kernel_size - 1
         fft_H = 2 ** int(np.ceil(np.log2(fft_H)))
@@ -195,33 +150,34 @@ class CustomFFTConv2d(nn.Module):
         padded_x = F.pad(x, (0, fft_W - width, 0, fft_H - height))
         
         # 对输入进行二维FFT
-        # 修正：创建正确大小的复数张量
         fft_x = torch.zeros(batch_size, in_channels, fft_H, fft_W, 
-                           dtype=torch.complex64, device=x.device)
+                           dtype=torch.cfloat, device=x.device)
         for b in range(batch_size):
             for c in range(in_channels):
-                # 确保输入是复数类型
-                complex_x = padded_x[b, c].to(torch.complex64)
-                fft_x[b, c] = fft2(complex_x)
+                fft_x[b, c] = fft2(padded_x[b, c].to(torch.cfloat))
         
-        # 准备卷积核的频域表示
-        weight_fft = torch.zeros(
-            self.out_channels, self.in_channels, fft_H, fft_W,
-            dtype=torch.complex64, device=x.device
-        )
-        for oc in range(self.out_channels):
-            for ic in range(self.in_channels):
-                # 卷积核填充
-                padded_weight = torch.zeros(fft_H, fft_W, device=x.device)
-                kernel = self.weight[oc, ic].to(torch.float32)
-                padded_weight[:self.kernel_size, :self.kernel_size] = kernel
-                # 计算FFT
-                weight_fft[oc, ic] = fft2(padded_weight.to(torch.complex64))
+        # 使用预计算的FFT权重
+        weight_fft = self.weight_fft
+        if weight_fft.numel() == 0:
+            # 首次推理时计算FFT权重
+            weight_fft = torch.zeros(
+                self.out_channels, self.in_channels, fft_H, fft_W,
+                dtype=torch.cfloat, device=x.device
+            )
+            for oc in range(self.out_channels):
+                for ic in range(self.in_channels):
+                    # 卷积核填充
+                    padded_weight = torch.zeros(fft_H, fft_W, device=x.device)
+                    kernel = self.weight[oc, ic].to(torch.float32)
+                    padded_weight[:self.kernel_size, :self.kernel_size] = kernel
+                    # 计算FFT
+                    weight_fft[oc, ic] = fft2(padded_weight.to(torch.cfloat))
+            self.weight_fft = weight_fft
         
         # 频域乘法
         fft_output = torch.zeros(
             batch_size, self.out_channels, fft_H, fft_W,
-            dtype=torch.complex64, device=x.device
+            dtype=torch.cfloat, device=x.device
         )
         for b in range(batch_size):
             for oc in range(self.out_channels):
@@ -229,16 +185,9 @@ class CustomFFTConv2d(nn.Module):
                     fft_output[b, oc] += fft_x[b, ic] * weight_fft[oc, ic]
         
         # 逆FFT
-        spatial_output = torch.zeros(
-            batch_size, self.out_channels, fft_H, fft_W,
-            dtype=torch.complex64, device=x.device
-        )
-        for b in range(batch_size):
-            for c in range(self.out_channels):
-                spatial_output[b, c] = ifft2(fft_output[b, c])
+        spatial_output = ifft2(fft_output).real
         
-        # 取实部并裁剪
-        spatial_output = spatial_output.real
+        # 裁剪结果
         out_height = (height + 2*self.padding - self.kernel_size) // self.stride + 1
         out_width = (width + 2*self.padding - self.kernel_size) // self.stride + 1
         start_h = (fft_H - out_height) // 2
@@ -251,15 +200,60 @@ class CustomFFTConv2d(nn.Module):
         
         return output
 
-# 单个卷积操作（自定义FFT卷积->BN->ReLU）
-class CustomFFTDoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
+###########################
+#----普通卷积实现----#
+###########################
+
+# 普通卷积模块（训练阶段使用）
+class NormalConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size, stride, padding, bias=bias
+        )
+    
+    def forward(self, x):
+        return self.conv(x)
+
+###########################
+#----可切换卷积模块----#
+###########################
+
+# 卷积模块（根据模式切换普通卷积或FFT卷积）
+class SwitchableConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True, use_fft_inference=True):
+        super().__init__()
+        self.use_fft_inference = use_fft_inference
+        
+        # 初始化两种卷积实现
+        self.normal_conv = NormalConv2d(in_channels, out_channels, kernel_size, stride, padding, bias)
+        self.fft_conv = FFTConv2d(in_channels, out_channels, kernel_size, stride, padding, bias)
+        
+        # 复制权重（确保两种卷积共享参数）
+        self.fft_conv.weight.data = self.normal_conv.conv.weight.data.clone()
+        if bias:
+            self.fft_conv.bias.data = self.normal_conv.conv.bias.data.clone()
+    
+    def forward(self, x):
+        if self.training:
+            # 训练阶段使用普通卷积
+            return self.normal_conv(x)
+        else:
+            # 推理阶段使用FFT卷积（如果启用）
+            if self.use_fft_inference:
+                return self.fft_conv(x)
+            else:
+                return self.normal_conv(x)
+
+# 单个卷积操作（卷积->BN->ReLU）
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels, use_fft_inference=True):
         super().__init__()
         self.double_conv = nn.Sequential(
-            CustomFFTConv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            SwitchableConv2d(in_channels, out_channels, kernel_size=3, padding=1, use_fft_inference=use_fft_inference),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            CustomFFTConv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            SwitchableConv2d(out_channels, out_channels, kernel_size=3, padding=1, use_fft_inference=use_fft_inference),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
@@ -268,28 +262,28 @@ class CustomFFTDoubleConv(nn.Module):
         return self.double_conv(x)
 
 # 下采样模块（编码器）
-class CustomFFTDown(nn.Module):
-    def __init__(self, in_channels, out_channels):
+class Down(nn.Module):
+    def __init__(self, in_channels, out_channels, use_fft_inference=True):
         super().__init__()
         self.maxpool_conv = nn.Sequential(
             nn.MaxPool2d(2),
-            CustomFFTDoubleConv(in_channels, out_channels)
+            DoubleConv(in_channels, out_channels, use_fft_inference)
         )
     
     def forward(self, x):
         return self.maxpool_conv(x)
 
 # 上采样模块（解码器）
-class CustomFFTUp(nn.Module):
-    def __init__(self, in_channels, out_channels, bilinear=True):
+class Up(nn.Module):
+    def __init__(self, in_channels, out_channels, bilinear=True, use_fft_inference=True):
         super().__init__()
         
         if bilinear:
             self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            self.conv = CustomFFTDoubleConv(in_channels, out_channels)
+            self.conv = DoubleConv(in_channels, out_channels, use_fft_inference)
         else:
             self.up = nn.ConvTranspose2d(in_channels // 2, in_channels // 2, kernel_size=2, stride=2)
-            self.conv = CustomFFTDoubleConv(in_channels, out_channels)
+            self.conv = DoubleConv(in_channels, out_channels, use_fft_inference)
     
     def forward(self, x1, x2):
         x1 = self.up(x1)
@@ -299,36 +293,37 @@ class CustomFFTUp(nn.Module):
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
-class CustomFFTOutConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels, use_fft_inference=True):
         super().__init__()
-        self.conv = CustomFFTConv2d(in_channels, out_channels, kernel_size=1)
+        self.conv = SwitchableConv2d(in_channels, out_channels, kernel_size=1, use_fft_inference=use_fft_inference)
     
     def forward(self, x):
         return self.conv(x)
 
 ################################
-#------自定义FFT U-Net模型------#
+#------可切换FFT的U-Net模型------#
 ################################
 
-class CustomFFTUNet(nn.Module):
-    def __init__(self, n_channels, n_classes, bilinear=True):
+class SwitchableFFTUNet(nn.Module):
+    def __init__(self, n_channels, n_classes, bilinear=True, use_fft_inference=True):
         super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.bilinear = bilinear
+        self.use_fft_inference = use_fft_inference  # 控制推理阶段是否使用FFT
         
-        self.inc = CustomFFTDoubleConv(n_channels, 64)
-        self.down1 = CustomFFTDown(64, 128)
-        self.down2 = CustomFFTDown(128, 256)
-        self.down3 = CustomFFTDown(256, 512)
+        self.inc = DoubleConv(n_channels, 64, use_fft_inference)
+        self.down1 = Down(64, 128, use_fft_inference)
+        self.down2 = Down(128, 256, use_fft_inference)
+        self.down3 = Down(256, 512, use_fft_inference)
         factor = 2 if bilinear else 1
-        self.down4 = CustomFFTDown(512, 1024 // factor)
-        self.up1 = CustomFFTUp(1024, 512 // factor, bilinear)
-        self.up2 = CustomFFTUp(512, 256 // factor, bilinear)
-        self.up3 = CustomFFTUp(256, 128 // factor, bilinear)
-        self.up4 = CustomFFTUp(128, 64, bilinear)
-        self.outc = CustomFFTOutConv(64, n_classes)
+        self.down4 = Down(512, 1024 // factor, use_fft_inference)
+        self.up1 = Up(1024, 512 // factor, bilinear, use_fft_inference)
+        self.up2 = Up(512, 256 // factor, bilinear, use_fft_inference)
+        self.up3 = Up(256, 128 // factor, bilinear, use_fft_inference)
+        self.up4 = Up(128, 64, bilinear, use_fft_inference)
+        self.outc = OutConv(64, n_classes, use_fft_inference)
     
     def forward(self, x):
         x1 = self.inc(x)
@@ -347,13 +342,13 @@ class CustomFFTUNet(nn.Module):
 #----定义训练和验证函数----#
 ###########################
 
-def train_model(model, train_loader, val_loader, optimizer, criterion, num_epochs, device, scheduler=None, save_path='custom_fft_unet_model.pth'):
+def train_model(model, train_loader, val_loader, optimizer, criterion, num_epochs, device, scheduler=None, save_path='switchable_fft_unet_model.pth'):
     model.to(device)
     scaler = GradScaler()
     best_val_loss = float('inf')
     
     for epoch in range(num_epochs):
-        # 训练阶段
+        # 训练阶段（自动使用普通卷积，因为model.training=True）
         model.train()
         train_loss = 0.0
         for images, masks in train_loader:
@@ -371,7 +366,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, num_epoch
             scaler.update()
             train_loss += loss.item()
         
-        # 验证阶段
+        # 验证阶段（使用普通卷积，与训练保持一致）
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -399,10 +394,15 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, num_epoch
     
     return model
 
-def test_model(model, test_loader, device, class_names):
-    model.to(device)
+def test_model(model, test_loader, device, class_names, use_fft_inference=True):
+    """测试模型，可选择是否在推理时使用FFT加速"""
+    # 确保模型处于推理模式
     model.eval()
+    # 设置推理模式是否使用FFT
+    if hasattr(model, 'use_fft_inference'):
+        model.use_fft_inference = use_fft_inference
     
+    model.to(device)
     all_preds = []
     all_labels = []
     
@@ -458,9 +458,15 @@ def test_model(model, test_loader, device, class_names):
     
     return acc, ious
 
-def visualize_predictions(model, test_loader, device, dataset, num_samples=5):
-    model.to(device)
+def visualize_predictions(model, test_loader, device, dataset, num_samples=5, use_fft_inference=True):
+    """可视化预测结果，可选择是否在推理时使用FFT加速"""
+    # 确保模型处于推理模式
     model.eval()
+    # 设置推理模式是否使用FFT
+    if hasattr(model, 'use_fft_inference'):
+        model.use_fft_inference = use_fft_inference
+    
+    model.to(device)
     
     fig, axes = plt.subplots(num_samples, 3, figsize=(15, num_samples*5))
     
@@ -504,7 +510,7 @@ def visualize_predictions(model, test_loader, device, dataset, num_samples=5):
 ###########################
 
 def main():
-    data_dir = './UNET_process/data/camVid'
+    data_dir = './UNET_process/data/camvid'
     n_classes = 12
     num_epochs = 30
     batch_size = 2
@@ -550,13 +556,16 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
     
+    # 可视化训练集样本
     train_dataset.visualize_sample(0)
     
+    # 计算类别权重（处理类别不平衡）
     class_weights = torch.ones(n_classes, dtype=torch.float32).to(device)
-    class_weights[11] = 0.5  # Unlabelled类别
+    class_weights[11] = 0.5  # Unlabelled类别权重降低
     
+    # 初始化模型（训练阶段使用普通卷积）
     criterion = nn.CrossEntropyLoss(weight=class_weights)
-    model = CustomFFTUNet(n_channels=3, n_classes=n_classes, bilinear=True)
+    model = SwitchableFFTUNet(n_channels=3, n_classes=n_classes, bilinear=True, use_fft_inference=False)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
     
@@ -570,14 +579,24 @@ def main():
         num_epochs=num_epochs,
         device=device,
         scheduler=scheduler,
-        save_path='custom_fft_camvid_unet_model.pth'
+        save_path='switchable_fft_camvid_unet_model.pth'
     )
     
-    print("\n开始测试模型...")
-    test_model(trained_model, test_loader, device, test_dataset.class_names)
+    # 加载最佳模型
+    model = SwitchableFFTUNet(n_channels=3, n_classes=n_classes, bilinear=True, use_fft_inference=True)
+    model.load_state_dict(torch.load('switchable_fft_camvid_unet_model.pth', map_location=device))
     
-    print("\n可视化预测结果...")
-    visualize_predictions(trained_model, test_loader, device, test_dataset)
+    print("\n使用普通卷积进行测试...")
+    test_model(model, test_loader, device, test_dataset.class_names, use_fft_inference=False)
+    
+    print("\n使用FFT加速卷积进行测试...")
+    test_model(model, test_loader, device, test_dataset.class_names, use_fft_inference=True)
+    
+    print("\n使用普通卷积可视化预测结果...")
+    visualize_predictions(model, test_loader, device, test_dataset, use_fft_inference=False)
+    
+    print("\n使用FFT加速卷积可视化预测结果...")
+    visualize_predictions(model, test_loader, device, test_dataset, use_fft_inference=True)
 
 if __name__ == '__main__':
     main()
